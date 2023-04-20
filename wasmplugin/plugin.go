@@ -34,13 +34,83 @@ func (*vmContext) NewPluginContext(contextID uint32) types.PluginContext {
 	return &corazaPlugin{}
 }
 
+type wafSets []wafSet
+
+func (wfs wafSets) newTransactionSets() txSets {
+	var txSets txSets
+
+	for _, wafSet := range wfs {
+		var txSet txSet
+		txSet.tx = wafSet.waf.NewTransaction()
+		txSet.authority = wafSet.authority
+
+		txSets = append(txSets, txSet)
+	}
+
+	return txSets
+}
+
+func (wfs wafSets) newLoggerSets(contextID uint32) loggerSets {
+	var loggerSets loggerSets
+
+	for _, wafSet := range wfs {
+		var loggerSet loggerSet
+		loggerSet.logger = wafSet.waf.NewTransaction().
+			DebugLogger().
+			With(debuglog.Uint("context_id", uint(contextID)))
+		loggerSet.authority = wafSet.authority
+
+		loggerSets = append(loggerSets, loggerSet)
+	}
+
+	return loggerSets
+}
+
+type wafSet struct {
+	waf       coraza.WAF
+	authority string
+}
+
+type txSets []txSet
+
+func (txs txSets) getTxFromAuthority(authority string) (ctypes.Transaction, bool) {
+	for _, txSet := range txs {
+		if txSet.authority == authority {
+			return txSet.tx, true
+		}
+	}
+
+	return nil, false
+}
+
+type txSet struct {
+	tx        ctypes.Transaction
+	authority string
+}
+
+type loggerSets []loggerSet
+
+func (lss loggerSets) getLoggerFromAuthority(authority string) (debuglog.Logger, bool) {
+	for _, loggerSet := range lss {
+		if loggerSet.authority == authority {
+			return loggerSet.logger, true
+		}
+	}
+
+	return nil, false
+}
+
+type loggerSet struct {
+	logger    debuglog.Logger
+	authority string
+}
+
 type corazaPlugin struct {
 	// Embed the default plugin context here,
 	// so that we don't need to reimplement all the methods.
 	types.DefaultPluginContext
 
-	waf coraza.WAF
-
+	wafSets    wafSets
 	identifier string
 
 	metrics *wafMetrics
@@ -58,27 +128,33 @@ func (ctx *corazaPlugin) OnPluginStart(pluginConfigurationSize int) types.OnPlug
 		return types.OnPluginStartStatusFailed
 	}
 
-	// First we initialize our waf and our seclang parser
-	conf := coraza.NewWAFConfig().
-		WithErrorCallback(logError).
-		WithDebugLogger(debuglog.DefaultWithPrinterFactory(logPrinterFactory)).
-		// TODO(anuraaga): Make this configurable in plugin configuration.
-		// WithRequestBodyLimit(1024 * 1024 * 1024).
-		// WithRequestBodyInMemoryLimit(1024 * 1024 * 1024).
-		// Limit equal to MemoryLimit: TinyGo compilation will prevent
-		// buffering request body to files anyways.
-		WithRootFS(root)
+	var wafSets wafSets
+	for _, ruleset := range config.rulesets {
+		var wafset wafSet
+		wafset.authority = ruleset.authority
 
-	waf, err := coraza.NewWAF(conf.WithDirectives(strings.Join(config.rules, "\n")))
-	if err != nil {
-		proxywasm.LogCriticalf("Failed to parse rules: %v", err)
-		return types.OnPluginStartStatusFailed
+		// First we initialize our waf and our seclang parser
+		conf := coraza.NewWAFConfig().
+			WithErrorCallback(logError).
+			WithDebugLogger(debuglog.DefaultWithPrinterFactory(logPrinterFactory)).
+			// TODO(anuraaga): Make this configurable in plugin configuration.
+			// WithRequestBodyLimit(1024 * 1024 * 1024).
+			// WithRequestBodyInMemoryLimit(1024 * 1024 * 1024).
+			// Limit equal to MemoryLimit: TinyGo compilation will prevent
+			// buffering request body to files anyways.
+			WithRootFS(root)
+
+		waf, err := coraza.NewWAF(conf.WithDirectives(strings.Join(ruleset.rules, "\n")))
+		if err != nil {
+			proxywasm.LogCriticalf("Failed to parse rules: %v", err)
+			return types.OnPluginStartStatusFailed
+		}
+		wafset.waf = waf
+		wafSets = append(wafSets, wafset)
 	}
 
-	ctx.waf = waf
-
+	ctx.wafSets = wafSets
 	ctx.identifier = config.identifier
-
 	ctx.metrics = NewWAFMetrics()
 
 	return types.OnPluginStartStatusOK
@@ -86,13 +162,10 @@ func (ctx *corazaPlugin) OnPluginStart(pluginConfigurationSize int) types.OnPlug
 
 func (ctx *corazaPlugin) NewHttpContext(contextID uint32) types.HttpContext {
 	return &httpContext{
-		contextID: contextID,
-		tx:        ctx.waf.NewTransaction(),
-		// TODO(jcchavezs): figure out how/when enable/disable metrics
-		metrics: ctx.metrics,
-		logger: ctx.waf.NewTransaction().
-			DebugLogger().
-			With(debuglog.Uint("context_id", uint(contextID))),
+		contextID:  contextID,
+		txSets:     ctx.wafSets.newTransactionSets(),
+		metrics:    ctx.metrics,
+		loggerSets: ctx.wafSets.newLoggerSets(contextID),
 		identifier: ctx.identifier,
 	}
 }
@@ -103,6 +176,7 @@ type httpContext struct {
 	types.DefaultHttpContext
 	contextID             uint32
 	tx                    ctypes.Transaction
+	txSets                txSets
 	httpProtocol          string
 	processedRequestBody  bool
 	processedResponseBody bool
@@ -110,14 +184,33 @@ type httpContext struct {
 	metrics               *wafMetrics
 	interruptionHandled   bool
 	logger                debuglog.Logger
+	loggerSets            loggerSets
 	identifier            string
+	authority             string
 }
 
 func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) types.Action {
 	defer logTime("OnHttpRequestHeaders", currentTime())
 
+	authority, err := proxywasm.GetHttpRequestHeader(":authority")
+	if err != nil {
+		return types.ActionContinue
+	}
+
+	ctx.authority = authority
+
+	tx, exist := ctx.txSets.getTxFromAuthority(ctx.authority)
+	if !exist {
+		return types.ActionContinue
+	}
+	ctx.tx = tx
+
+	log, exist := ctx.loggerSets.getLoggerFromAuthority(ctx.authority)
+	if !exist {
+		return types.ActionContinue
+	}
+	ctx.logger = log
 	ctx.metrics.CountTX()
-	tx := ctx.tx
 
 	// This currently relies on Envoy's behavior of mapping all requests to HTTP/2 semantics
 	// and its request properties, but they may not be true of other proxies implementing
@@ -126,9 +219,10 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 	if tx.IsRuleEngineOff() {
 		return types.ActionContinue
 	}
+
 	// OnHttpRequestHeaders does not terminate if IP/Port retrieve goes wrong
-	srcIP, srcPort := retrieveAddressInfo(ctx.logger, "source")
-	dstIP, dstPort := retrieveAddressInfo(ctx.logger, "destination")
+	srcIP, srcPort := retrieveAddressInfo(log, "source")
+	dstIP, dstPort := retrieveAddressInfo(log, "destination")
 
 	tx.ProcessConnection(srcIP, srcPort, dstIP, dstPort)
 
@@ -172,15 +266,15 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 	}
 
 	// CRS rules tend to expect Host even with HTTP/2
-	authority, err := proxywasm.GetHttpRequestHeader(":authority")
+	authority, err = proxywasm.GetHttpRequestHeader(":authority")
 	if err == nil {
 		tx.AddRequestHeader("Host", authority)
-		tx.SetServerName(parseServerName(ctx.logger, authority))
+		tx.SetServerName(parseServerName(log, authority))
 	}
 
 	interruption := tx.ProcessRequestHeaders()
 	if interruption != nil {
-		return ctx.handleInterruption("http_request_headers", interruption, ctx.identifier)
+		return ctx.handleInterruption(log, "http_request_headers", interruption, ctx.identifier, ctx.authority)
 	}
 
 	return types.ActionContinue
@@ -195,6 +289,10 @@ func (ctx *httpContext) OnHttpRequestBody(bodySize int, endOfStream bool) types.
 	}
 
 	if ctx.processedRequestBody {
+		return types.ActionContinue
+	}
+
+	if ctx.tx == nil {
 		return types.ActionContinue
 	}
 
@@ -216,7 +314,7 @@ func (ctx *httpContext) OnHttpRequestBody(bodySize int, endOfStream bool) types.
 		}
 
 		if interruption != nil {
-			return ctx.handleInterruption("http_request_body", interruption, ctx.identifier)
+			return ctx.handleInterruption(ctx.logger, "http_request_body", interruption, ctx.identifier, ctx.authority)
 		}
 
 		return types.ActionContinue
@@ -232,7 +330,7 @@ func (ctx *httpContext) OnHttpRequestBody(bodySize int, endOfStream bool) types.
 			}
 
 			if interruption != nil {
-				return ctx.handleInterruption("http_request_body", interruption, ctx.identifier)
+				return ctx.handleInterruption(ctx.logger, "http_request_body", interruption, ctx.identifier, ctx.authority)
 			}
 
 			ctx.bodyReadIndex += bodySize
@@ -265,7 +363,7 @@ func (ctx *httpContext) OnHttpRequestBody(bodySize int, endOfStream bool) types.
 			return types.ActionContinue
 		}
 		if interruption != nil {
-			return ctx.handleInterruption("http_request_body", interruption, ctx.identifier)
+			return ctx.handleInterruption(ctx.logger, "http_request_body", interruption, ctx.identifier, ctx.authority)
 		}
 
 		return types.ActionContinue
@@ -292,6 +390,10 @@ func (ctx *httpContext) OnHttpResponseHeaders(numHeaders int, endOfStream bool) 
 		}
 	}
 
+	if ctx.tx == nil {
+		return types.ActionContinue
+	}
+
 	tx := ctx.tx
 
 	if tx.IsRuleEngineOff() {
@@ -309,7 +411,7 @@ func (ctx *httpContext) OnHttpResponseHeaders(numHeaders int, endOfStream bool) 
 			return types.ActionContinue
 		}
 		if interruption != nil {
-			return ctx.handleInterruption("http_response_headers", interruption, ctx.identifier)
+			return ctx.handleInterruption(ctx.logger, "http_response_headers", interruption, ctx.identifier, ctx.authority)
 		}
 	}
 
@@ -339,7 +441,7 @@ func (ctx *httpContext) OnHttpResponseHeaders(numHeaders int, endOfStream bool) 
 
 	interruption := tx.ProcessResponseHeaders(code, ctx.httpProtocol)
 	if interruption != nil {
-		return ctx.handleInterruption("http_response_headers", interruption, ctx.identifier)
+		return ctx.handleInterruption(ctx.logger, "http_response_headers", interruption, ctx.identifier, ctx.authority)
 	}
 
 	return types.ActionContinue
@@ -358,6 +460,10 @@ func (ctx *httpContext) OnHttpResponseBody(bodySize int, endOfStream bool) types
 			Msg("Response body interruption already handled, keeping replacing the body")
 		// Interruption happened, we don't want to send response body data
 		return replaceResponseBodyWhenInterrupted(ctx.logger, bodySize)
+	}
+
+	if ctx.tx == nil {
+		return types.ActionContinue
 	}
 
 	tx := ctx.tx
@@ -381,7 +487,7 @@ func (ctx *httpContext) OnHttpResponseBody(bodySize int, endOfStream bool) types
 			// Proxy-wasm can not anymore deny the response. The best interruption is emptying the body
 			// Coraza Multiphase evaluation will help here avoiding late interruptions
 			ctx.bodyReadIndex = bodySize // hacky: bodyReadIndex stores the body size that has to be replaced
-			return ctx.handleInterruption("http_response_body", interruption, ctx.identifier)
+			return ctx.handleInterruption(ctx.logger, "http_response_body", interruption, ctx.identifier, ctx.authority)
 		}
 		return types.ActionContinue
 	}
@@ -398,7 +504,7 @@ func (ctx *httpContext) OnHttpResponseBody(bodySize int, endOfStream bool) types
 			// it is internally needed to replace the full body if the tx is interrupted
 			ctx.bodyReadIndex += bodySize
 			if interruption != nil {
-				return ctx.handleInterruption("http_response_body", interruption, ctx.identifier)
+				return ctx.handleInterruption(ctx.logger, "http_response_body", interruption, ctx.identifier, ctx.authority)
 			}
 		} else if err != types.ErrorStatusNotFound {
 			ctx.logger.Error().
@@ -423,7 +529,7 @@ func (ctx *httpContext) OnHttpResponseBody(bodySize int, endOfStream bool) types
 			return types.ActionContinue
 		}
 		if interruption != nil {
-			return ctx.handleInterruption("http_response_body", interruption, ctx.identifier)
+			return ctx.handleInterruption(ctx.logger, "http_response_body", interruption, ctx.identifier, ctx.authority)
 		}
 		return types.ActionContinue
 	}
@@ -436,46 +542,48 @@ func (ctx *httpContext) OnHttpStreamDone() {
 	defer logTime("OnHttpStreamDone", currentTime())
 	tx := ctx.tx
 
-	if !tx.IsRuleEngineOff() {
-		// Responses without body won't call OnHttpResponseBody, but there are rules in the response body
-		// phase that still need to be executed. If they haven't been executed yet, now is the time.
-		if !ctx.processedResponseBody {
-			ctx.processedResponseBody = true
-			_, err := tx.ProcessResponseBody()
-			if err != nil {
-				ctx.logger.Error().
-					Err(err).
-					Msg("Failed to process response body")
+	if tx != nil {
+		if !tx.IsRuleEngineOff() {
+			// Responses without body won't call OnHttpResponseBody, but there are rules in the response body
+			// phase that still need to be executed. If they haven't been executed yet, now is the time.
+			if !ctx.processedResponseBody {
+				ctx.processedResponseBody = true
+				_, err := tx.ProcessResponseBody()
+				if err != nil {
+					ctx.logger.Error().
+						Err(err).
+						Msg("Failed to process response body")
+				}
 			}
 		}
-	}
-	// ProcessLogging is still called even if RuleEngine is off for potential logs generated before the engine is turned off.
-	// Internally, if the engine is off, no log phase rules are evaluated
-	ctx.tx.ProcessLogging()
+		// ProcessLogging is still called even if RuleEngine is off for potential logs generated before the engine is turned off.
+		// Internally, if the engine is off, no log phase rules are evaluated
+		ctx.tx.ProcessLogging()
 
-	_ = ctx.tx.Close()
-	ctx.logger.Info().Msg("Finished")
-	logMemStats()
+		_ = ctx.tx.Close()
+		ctx.logger.Info().Msg("Finished")
+		logMemStats()
+	}
 }
 
 const noGRPCStream int32 = -1
 
-func (ctx *httpContext) handleInterruption(phase string, interruption *ctypes.Interruption, identifier string) types.Action {
+func (ctx *httpContext) handleInterruption(logger debuglog.Logger, phase string, interruption *ctypes.Interruption, identifier string, authority string) types.Action {
 	if ctx.interruptionHandled {
 		// handleInterruption should never be called more than once
 		panic("Interruption already handled")
 	}
 
-	ctx.metrics.CountTXInterruption(phase, interruption.RuleID, identifier)
+	ctx.metrics.CountTXInterruption(phase, interruption.RuleID, identifier, authority)
 
-	ctx.logger.Info().
+	logger.Info().
 		Str("action", interruption.Action).
 		Str("phase", phase).
 		Msg("Transaction interrupted")
 
 	ctx.interruptionHandled = true
 	if phase == "http_response_body" {
-		return replaceResponseBodyWhenInterrupted(ctx.logger, ctx.bodyReadIndex)
+		return replaceResponseBodyWhenInterrupted(logger, ctx.bodyReadIndex)
 	}
 
 	statusCode := interruption.Status

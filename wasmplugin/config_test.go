@@ -23,6 +23,9 @@ func TestParsePluginConfiguration(t *testing.T) {
 		{
 			name:   "empty json",
 			config: "{}",
+			expectConfig: pluginConfiguration{
+				identifier: "default",
+			},
 		},
 		{
 			name:      "bad config",
@@ -33,22 +36,73 @@ func TestParsePluginConfiguration(t *testing.T) {
 			name: "inline",
 			config: `
 			{
-				"rules": ["SecRuleEngine On"]
+				"rulesets": [{
+					"rules": [
+					  "SecRuleEngine On"
+					],
+					"authority": "foo"
+				  }
+				]
 			}
 			`,
 			expectConfig: pluginConfiguration{
-				rules: []string{"SecRuleEngine On"},
+				rulesets: []ruleSet{
+					{
+						rules:     []string{"SecRuleEngine On"},
+						authority: "foo",
+					},
+				},
+				identifier: "default",
 			},
 		},
 		{
 			name: "inline many entries",
 			config: `
-			{ 
-				"rules": ["SecRuleEngine On", "Include @owasp_crs/*.conf\nSecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""]
+			{
+				"rulesets": [{
+					"rules": ["SecRuleEngine On", "Include @owasp_crs/*.conf\nSecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""],
+					"authority": "foo"
+				  }
+				]
 			}
 			`,
 			expectConfig: pluginConfiguration{
-				rules: []string{"SecRuleEngine On", "Include @owasp_crs/*.conf\nSecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""},
+				rulesets: []ruleSet{
+					{
+						rules:     []string{"SecRuleEngine On", "Include @owasp_crs/*.conf\nSecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""},
+						authority: "foo",
+					},
+				},
+				identifier: "default",
+			},
+		},
+		{
+			name: "many ruleset",
+			config: `
+			{
+				"rulesets": [{
+					"rules": ["SecRuleEngine On", "Include @owasp_crs/*.conf\nSecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""],
+					"authority": "foo"
+				  },
+				  {
+					"rules": ["SecRuleEngine On", "Include @owasp_crs/*.conf\nSecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""],
+					"authority": "bar"
+				  }
+				]
+			}
+			`,
+			expectConfig: pluginConfiguration{
+				rulesets: []ruleSet{
+					{
+						rules:     []string{"SecRuleEngine On", "Include @owasp_crs/*.conf\nSecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""},
+						authority: "foo",
+					},
+					{
+						rules:     []string{"SecRuleEngine On", "Include @owasp_crs/*.conf\nSecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""},
+						authority: "bar",
+					},
+				},
+				identifier: "default",
 			},
 		},
 	}
@@ -57,7 +111,7 @@ func TestParsePluginConfiguration(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			cfg, err := parsePluginConfiguration([]byte(testCase.config))
 			assert.Equal(t, testCase.expectErr, err)
-			assert.ElementsMatch(t, testCase.expectConfig.rules, cfg.rules)
+			assert.Equal(t, testCase.expectConfig, cfg)
 		})
 	}
 }
