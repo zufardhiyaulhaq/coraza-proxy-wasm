@@ -56,6 +56,33 @@ func TestParsePluginConfiguration(t *testing.T) {
 			},
 		},
 		{
+			name: "global rules",
+			config: `
+			{
+				"rulesets": [{
+					"rules": [
+					  "SecRuleEngine On"
+					],
+					"authority": "foo"
+				  }
+				],
+				"globalRules": [
+					"SecRuleEngine On"
+				]
+			}
+			`,
+			expectConfig: pluginConfiguration{
+				rulesets: []ruleSet{
+					{
+						rules:     []string{"SecRuleEngine On"},
+						authority: "foo",
+					},
+				},
+				identifier:  "default",
+				globalRules: []string{"SecRuleEngine On"},
+			},
+		},
+		{
 			name: "inline many entries",
 			config: `
 			{

@@ -110,8 +110,10 @@ type corazaPlugin struct {
 	// so that we don't need to reimplement all the methods.
 	types.DefaultPluginContext
 
-	wafSets    wafSets
-	identifier string
+	wafGlobal        coraza.WAF
+	wafGlobalEnabled bool
+	wafSets          wafSets
+	identifier       string
 
 	metrics *wafMetrics
 }
@@ -153,6 +155,28 @@ func (ctx *corazaPlugin) OnPluginStart(pluginConfigurationSize int) types.OnPlug
 		wafSets = append(wafSets, wafset)
 	}
 
+	if len(config.globalRules) != 0 {
+		ctx.wafGlobalEnabled = true
+
+		conf := coraza.NewWAFConfig().
+			WithErrorCallback(logError).
+			WithDebugLogger(debuglog.DefaultWithPrinterFactory(logPrinterFactory)).
+			// TODO(anuraaga): Make this configurable in plugin configuration.
+			// WithRequestBodyLimit(1024 * 1024 * 1024).
+			// WithRequestBodyInMemoryLimit(1024 * 1024 * 1024).
+			// Limit equal to MemoryLimit: TinyGo compilation will prevent
+			// buffering request body to files anyways.
+			WithRootFS(root)
+
+		waf, err := coraza.NewWAF(conf.WithDirectives(strings.Join(config.globalRules, "\n")))
+		if err != nil {
+			proxywasm.LogCriticalf("Failed to parse rules: %v", err)
+			return types.OnPluginStartStatusFailed
+		}
+
+		ctx.wafGlobal = waf
+	}
+
 	ctx.wafSets = wafSets
 	ctx.identifier = config.identifier
 	ctx.metrics = NewWAFMetrics()
@@ -161,13 +185,23 @@ func (ctx *corazaPlugin) OnPluginStart(pluginConfigurationSize int) types.OnPlug
 }
 
 func (ctx *corazaPlugin) NewHttpContext(contextID uint32) types.HttpContext {
-	return &httpContext{
+	httpContext := httpContext{
 		contextID:  contextID,
 		txSets:     ctx.wafSets.newTransactionSets(),
 		metrics:    ctx.metrics,
 		loggerSets: ctx.wafSets.newLoggerSets(contextID),
 		identifier: ctx.identifier,
 	}
+
+	if ctx.wafGlobalEnabled {
+		httpContext.txGlobalEnabled = true
+		httpContext.txGlobal = ctx.wafGlobal.NewTransaction()
+		httpContext.loggerGlobal = ctx.wafGlobal.NewTransaction().
+			DebugLogger().
+			With(debuglog.Uint("context_id", uint(contextID)))
+	}
+
+	return &httpContext
 }
 
 type httpContext struct {
@@ -177,6 +211,8 @@ type httpContext struct {
 	contextID             uint32
 	tx                    ctypes.Transaction
 	txSets                txSets
+	txGlobal              ctypes.Transaction
+	txGlobalEnabled       bool
 	httpProtocol          string
 	processedRequestBody  bool
 	processedResponseBody bool
@@ -185,6 +221,7 @@ type httpContext struct {
 	interruptionHandled   bool
 	logger                debuglog.Logger
 	loggerSets            loggerSets
+	loggerGlobal          debuglog.Logger
 	identifier            string
 	authority             string
 }
@@ -199,32 +236,44 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 
 	ctx.authority = authority
 
+	if ctx.txGlobalEnabled {
+		ctx.tx = ctx.txGlobal
+		ctx.logger = ctx.loggerGlobal
+	}
+
 	tx, exist := ctx.txSets.getTxFromAuthority(ctx.authority)
-	if !exist {
+	if exist {
+		ctx.tx = tx
+	}
+
+	if !exist && !ctx.txGlobalEnabled {
 		return types.ActionContinue
 	}
-	ctx.tx = tx
 
 	log, exist := ctx.loggerSets.getLoggerFromAuthority(ctx.authority)
-	if !exist {
+	if exist {
+		ctx.logger = log
+	}
+
+	if !exist && !ctx.txGlobalEnabled {
 		return types.ActionContinue
 	}
-	ctx.logger = log
+
 	ctx.metrics.CountTX()
 
 	// This currently relies on Envoy's behavior of mapping all requests to HTTP/2 semantics
 	// and its request properties, but they may not be true of other proxies implementing
 	// proxy-wasm.
 
-	if tx.IsRuleEngineOff() {
+	if ctx.tx.IsRuleEngineOff() {
 		return types.ActionContinue
 	}
 
 	// OnHttpRequestHeaders does not terminate if IP/Port retrieve goes wrong
-	srcIP, srcPort := retrieveAddressInfo(log, "source")
-	dstIP, dstPort := retrieveAddressInfo(log, "destination")
+	srcIP, srcPort := retrieveAddressInfo(ctx.logger, "source")
+	dstIP, dstPort := retrieveAddressInfo(ctx.logger, "destination")
 
-	tx.ProcessConnection(srcIP, srcPort, dstIP, dstPort)
+	ctx.tx.ProcessConnection(srcIP, srcPort, dstIP, dstPort)
 
 	// Note the pseudo-header :path includes the query.
 	// See https://httpwg.org/specs/rfc9113.html#rfc.section.8.3.1
@@ -253,7 +302,7 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 
 	ctx.httpProtocol = string(protocol)
 
-	tx.ProcessURI(uri, method, ctx.httpProtocol)
+	ctx.tx.ProcessURI(uri, method, ctx.httpProtocol)
 
 	hs, err := proxywasm.GetHttpRequestHeaders()
 	if err != nil {
@@ -262,19 +311,19 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 	}
 
 	for _, h := range hs {
-		tx.AddRequestHeader(h[0], h[1])
+		ctx.tx.AddRequestHeader(h[0], h[1])
 	}
 
 	// CRS rules tend to expect Host even with HTTP/2
 	authority, err = proxywasm.GetHttpRequestHeader(":authority")
 	if err == nil {
-		tx.AddRequestHeader("Host", authority)
-		tx.SetServerName(parseServerName(log, authority))
+		ctx.tx.AddRequestHeader("Host", authority)
+		ctx.tx.SetServerName(parseServerName(ctx.logger, authority))
 	}
 
-	interruption := tx.ProcessRequestHeaders()
+	interruption := ctx.tx.ProcessRequestHeaders()
 	if interruption != nil {
-		return ctx.handleInterruption(log, "http_request_headers", interruption, ctx.identifier, ctx.authority)
+		return ctx.handleInterruption(ctx.logger, "http_request_headers", interruption, ctx.identifier, ctx.authority)
 	}
 
 	return types.ActionContinue
